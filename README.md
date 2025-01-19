@@ -13,7 +13,6 @@ This project implements a Flask-based web application that allows users to uploa
 3. [Setup Instructions](#setup-instructions)
 4. [Application Workflow](#application-workflow)
 5. [Usage](#usage)
-6. [Visuals](#visuals)
 
 ---
 
