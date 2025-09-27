@@ -1,286 +1,233 @@
 import os
 import uuid
 import base64
-from flask import Flask, request, jsonify, render_template
-from werkzeug.utils import secure_filename
+import streamlit as st
 from unstructured.partition.pdf import partition_pdf
 from dotenv import load_dotenv
-from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.documents import Document
 from langchain_community.vectorstores import FAISS
-from langchain_openai import OpenAIEmbeddings
 from langchain_core.messages import HumanMessage
-from PIL import Image
-from IPython.display import display, HTML
-
-# Initialize Flask app
-app = Flask(__name__)
+from sentence_transformers import SentenceTransformer, CrossEncoder
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 
 # Load environment variables
 load_dotenv()
-
-# Set OpenAI API key
 os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+st.title("DocPilot: The MultiModal RAG Assistant")
+st.write("Upload a PDF to ask questions about its content.")
 
-# Configure upload folder and allowed extensions
-UPLOAD_FOLDER = './uploads'
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-app.config['ALLOWED_EXTENSIONS'] = {'pdf'}
+# Helper Functions
+def encode_image(image_path):
+    with open(image_path, "rb") as image_file:
+        return base64.b64encode(image_file.read()).decode("utf-8")
 
-# Global variables
-global db  # Vectorstore database
-db = None
 
-# Function: Check if file extension is allowed
-def allowed_file(filename):
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in app.config['ALLOWED_EXTENSIONS']
-
-# Function: Create documents for retriever
-def create_document(text,text_summary,image_base64_list,image_summary,table,table_summary):
-    documents=[]
-
-    #for adding text
-    for text,text_summary in zip(text,text_summary):
-      id=str(uuid.uuid4())
-      doc=Document(
-          page_content=text_summary,
-          metadata={
-              "id":id,
-              "type":"text",
-              "original_content":text
-          }
-      )
-      documents.append(doc)
-
-    #for adding image
-    for image_base64,image_summary in zip(image_base64_list,image_summary):
-        id=str(uuid.uuid4())
-        doc=Document(
-            page_content=image_summary,
+def create_documents(texts, image_base64s, image_summaries, tables, table_summaries):
+    documents = []
+    #Add text
+    for content in texts:
+        doc_id = str(uuid.uuid4())
+        doc = Document(
+            page_content=content,
             metadata={
-                "id":id,
-                "type":"image",
-                "original_content":image_base64
+                "id": doc_id,
+                "type": "text",
+                "original_content": content
             }
         )
         documents.append(doc)
-
-    #for adding table
-    for table,table_summary in zip(table,table_summary):
-        id=str(uuid.uuid4())
-        doc=Document(
-            page_content=table_summary,
+        
+    # Add table summary
+    for content, summary in zip(tables, table_summaries):
+        doc_id = str(uuid.uuid4())
+        doc = Document(
+            page_content=summary,
             metadata={
-                "id":id,
-                "type":"text",
-                "original_content":table
+                "id": doc_id,
+                "type": "text",
+                "original_content": content
             }
         )
         documents.append(doc)
-
+        
+    # Add image summaries
+    for b64, summary in zip(image_base64s, image_summaries):
+        doc_id = str(uuid.uuid4())
+        doc = Document(
+            page_content=summary,
+            metadata={
+                "id": doc_id,
+                "type": "image",
+                "original_content": b64
+            }
+        )
+        documents.append(doc)
     return documents
 
-# Route: Home page (upload form)
-@app.route('/')
-def upload_file():
-    return render_template('upload.html')
 
-# Route: Handle file upload
-@app.route('/upload', methods=['POST'])
-def handle_upload():
-    global db
+def process_uploaded_file(uploaded_file, llm, vision_llm):
+    temp_dir = "./uploads"
+    os.makedirs(temp_dir, exist_ok=True)
+    file_path = os.path.join(temp_dir, uploaded_file.name)
+    with open(file_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
 
-    # Validate uploaded file
-    if 'file' not in request.files:
-        return jsonify({"error": "No file part"}), 400
-
-    file = request.files['file']
-    if file.filename == '':
-        return jsonify({"error": "No selected file"}), 400
-
-    if file and allowed_file(file.filename):
-        # Save the uploaded file
-        filename = secure_filename(file.filename)
-        file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        file.save(file_path)
-        print("File Uploaded!")
-
-        # Partition PDF
-        raw_element = partition_pdf(
+    # Partition the PDF
+    image_output_dir = "./raw_elements"
+    os.makedirs(image_output_dir, exist_ok=True)
+    
+    with st.spinner("Step 1/4: Extracting elements from the PDF..."):
+        raw_elements = partition_pdf(
             filename=file_path,
             strategy="hi_res",
             extract_images_in_pdf=True,
-            extract_image_block_types=["Image", "Table"],
-            extract_image_block_to_payload=False,
-            extract_image_block_output_dir="./raw_elements"
+            extract_image_block_output_dir=image_output_dir
         )
 
-        print("Elements are extracted!")
-        
-        Text=[]
-        Image=[]
-        Table=[]
-
-        for element in raw_element:
+        texts, tables = [], []
+        for element in raw_elements:
             if "unstructured.documents.elements.Text" in str(type(element)):
-                Text.append(str(element))
+                texts.append(str(element))
             elif "unstructured.documents.elements.NarrativeText" in str(type(element)):
-                Text.append(str(element))
+                texts.append(str(element))
             elif "unstructured.documents.elements.ListItem" in str(type(element)):
-                Text.append(str(element))
+                texts.append(str(element))
             elif "unstructured.documents.elements.FigureCaption" in str(type(element)):
-                Text.append(str(element))
+                texts.append(str(element))
             elif "unstructured.documents.elements.Table" in str(type(element)):
-                Table.append(str(element))
-            elif "unstructured.documents.elements.Image" in str(type(element)):
-                Image.append(str(element))
+                tables.append(str(element))
 
-        # Summarization using OpenAI
-        model = ChatOpenAI(temperature=0, model="gpt-4")
+    # Summarize tables
+    prompt_text = "You are an assistant tasked with summarizing text for retrieval. Give a concise summary of the following content that is well optimized for retrieval:\n---\n{element}"
+    prompt = ChatPromptTemplate.from_template(prompt_text)
+    summarize_chain = prompt | llm | StrOutputParser()
+    
+    with st.spinner("Step 2/4: Summarizing text and tables..."):
+        table_summaries = summarize_chain.batch(tables, {"max_concurrency": 5})
 
-        # Summarize text
-        #creating prompt
-        prompt_text="""You are an assistant tasked with summarizing text that has been extracted from a document in concise form. \n
-                       The document's content has been embedded in a vector store, and the text for summarization is provided below: {element}"""
-        text_prompt=ChatPromptTemplate.from_template(prompt_text)
-        text_summarizing_chain = text_prompt | model | StrOutputParser()
-        text_summary = [text_summarizing_chain.invoke({"element": t}) for t in Text]
-
-        print("Text Summarization done!")
+    # Summarize Images
+    with st.spinner("Step 3/4: Summarizing images..."):
+        image_base64s = []
+        image_summaries = []
+        image_paths = sorted([os.path.join(image_output_dir, f) for f in os.listdir(image_output_dir) if f.endswith(".jpg")])
         
-        # Summarize tables
-        prompt_text="""You are an assistant tasked with summarizing table content that has been extracted from a document in concise form. \n
-              The document's content has been embedded in a vector store, and the table for summarization is provided below: {element}"""
-        table_prompt=ChatPromptTemplate.from_template(prompt_text)
-        table_summarizing_chain = table_prompt | model | StrOutputParser()
-        table_summary = [table_summarizing_chain.invoke({"element": t}) for t in Table]
-
-        print("Table Summarization done!")
-        
-        # Process images (mock summary)
-        #encode image to base64
-        def encode_image(image_path):
-            with open(image_path,"rb") as image_file:
-                return base64.b64encode(image_file.read()).decode("utf-8")
-
-        #image summarising function
-        def summarize_image(image_base64,prompt):
-
-            #initiating gpt-4o for image summarisation
-            model=ChatOpenAI(temperature=0, model="gpt-4o")
-
-            image_summarising_chain=model.invoke(
-                [
-                HumanMessage(
-                    content=[
-                            {"type":"text","text":prompt},
-                            {
-                                "type":"image_url",
-                                "image_url":{"url": f"data:image/jpg;base64,{image_base64}"}}
-                            ]
-                            )
+        for img_path in image_paths:
+            base64_image = encode_image(img_path)
+            image_base64s.append(base64_image)
+            
+            image_message = HumanMessage(
+                content=[
+                    {"type": "text", "text": "Summarize this image for retrieval. Describe its key elements and purpose concisely."},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
                 ]
             )
-            return image_summarising_chain.content
+            summary = vision_llm.invoke([image_message]).content
+            image_summaries.append(summary)
 
-        # Prompt
-        prompt = """You are an assistant tasked with summarizing images for retrieval. \n
-        These summaries will be embedded and used to retrieve the raw image. \n
-        Give a concise summary of the image that is well optimized for retrieval."""
-        
-        image_summary={"path":[],"summary":[]}
-        image_base64_list=[]
-        for img_path in os.listdir("raw_elements"):
-            if img_path.endswith(".jpg"):
-                image_base64=encode_image(os.path.join("raw_elements",img_path))
-                image_summary["path"].append(os.path.join("raw_elements",img_path))
-                image_summary["summary"].append(summarize_image(image_base64,prompt))
-                image_base64_list.append(image_base64)
-        
-        print("Image Summarization done!")
-        
-        #create document
-        document=create_document(Text,text_summary,image_base64_list,image_summary["summary"],Table,table_summary)
-
-        #creating retriever
-        db=FAISS.from_documents(documents=document,embedding=OpenAIEmbeddings())
-
-        print("Vectorstore Created!")
-        
-        return jsonify({"message": "File uploaded and processed successfully. Ready for questions!"})
-
-    return jsonify({"error": "Invalid file type"}), 400
-
-# Route: Query processing
-@app.route('/query', methods=['POST'])
-def handle_query():
-    global db
-    if not db:
-        return jsonify({"error": "No document has been uploaded yet."}), 400
-
-    data = request.get_json()
-    query = data.get("query", "")
-    if not query:
-        return jsonify({"error": "Query is required"}), 400
-
-    try:
-        #using gpt-4 as a llm model
-        model=ChatOpenAI(temperature=0, model="gpt-4")
-
-        #prompt
-        prompt_text="""
-        You are a AI assistant.
-        Answer the question based only on the following context, which can include text, images and tables:
-        {context}
-        Question: {question}
-        Don't answer if you are not sure and decline to answer and say "Sorry, I don't have much information about it."
-        Just return the helpful answer in as much as detailed possible.
-        Answer:
-        """
-        prompt=ChatPromptTemplate.from_template(prompt_text)
-        
-        #creating chain
-        multimodal_rag_chain=prompt|model|StrOutputParser()
-
-        def content_to_display(query):
-            relevant_documents=db.similarity_search(query)
-            relevant_images=[]
-            context=""
-            for doc in relevant_documents:
-                if doc.metadata["type"]=="text":
-                    context+=doc.metadata["original_content"]
-                elif doc.metadata["type"]=="image":
-                    context+=doc.page_content
-                    relevant_images.append(doc.metadata["original_content"])
-                elif doc.metadata["type"]=="table":
-                    context+=doc.metadata["original_content"]
+    # Create documents and build the vector store
+    with st.spinner("Step 4/4: Creating vector store..."):
+        documents = create_documents(texts, image_base64s, image_summaries, tables, table_summaries)
+        embeddings = OpenAIEmbeddings()
+        vectorstore = FAISS.from_documents(documents=documents, embedding=embeddings)
+    
+    st.session_state.db = vectorstore
+    st.success("File processed successfully! You can now ask questions.")
 
 
-            result=multimodal_rag_chain.invoke({"context":context,"question":query})
-            return result,relevant_images
-        
-        def answer(query):
-            answer,relevant_images=content_to_display(query)
+# --- Reranking with Cross-Encoder ---
+@st.cache_resource
+def load_cross_encoder():
+    return CrossEncoder('cross-encoder/ms-marco-TinyBERT-L-2-v2') 
+cross_encoder = load_cross_encoder()
 
-            #displaying Image
-            html_image=""
-            if relevant_images:
-                for image_base64 in relevant_images:
-                    html_image = f'<img src="data:image/jpeg;base64,{image_base64}" alt="Base64 Image" style="width:300px;"/>'
-            
-            return answer,html_image        
-        
-        answer,html_image=answer(query)
-        
-        return jsonify({"answer": answer,
-                        "html_image":html_image})
+def rerank_documents(query, retrieved_docs, top_n=5):
+    pairs = [(query, doc.page_content) for doc in retrieved_docs]
+    scores = cross_encoder.predict(pairs)
+    
+    scored_docs = list(zip(scores, retrieved_docs))
+    scored_docs.sort(key=lambda x: x[0], reverse=True)
+    
+    return [doc for score, doc in scored_docs[:top_n]]
 
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+# File upload
+with st.sidebar:
+ 
+    uploaded_file = st.file_uploader("Upload a PDF file", type="pdf")
+    
+    if uploaded_file:
+        if st.button("Process Document"):
+            llm = ChatOpenAI(model="gpt-4o", temperature=0.1)
+            vision_llm = ChatOpenAI(model="gpt-4o", temperature=0.1)
+            process_uploaded_file(uploaded_file, llm, vision_llm)
 
-if __name__ == '__main__':
-    app.run(debug=True)
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+# Display chat messages
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+        if "images" in message and message["images"]:
+            for img_b64 in message["images"]:
+                st.image(base64.b64decode(img_b64), width=300)
+
+prompt = st.chat_input("Ask a question about the document...")
+
+if prompt and prompt.strip() != "":
+    if "db" not in st.session_state or st.session_state.db is None:
+        st.warning("Please upload and process a document first.")
+    else:
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking..."):
+                db = st.session_state.db
+                
+                # Retrieval
+                retrieved_docs = db.similarity_search(prompt, k=10)
+                
+                # Reranking
+                reranked_docs = rerank_documents(prompt, retrieved_docs)
+                
+                # Build context
+                context = ""
+                relevant_images = []
+                for doc in reranked_docs:
+                    if doc.metadata["type"] == "text":
+                        context += doc.metadata["original_content"] + "\n---\n"
+                    elif doc.metadata["type"] == "table":
+                        context += doc.page_content + "\n---\n"    
+                    elif doc.metadata["type"] == "image":
+                        context += doc.page_content + "\n---\n"
+                        relevant_images.append(doc.metadata["original_content"])
+                
+                # Generate Answer
+                rag_prompt_template = """
+                You are an expert AI assistant. Answer the question based ONLY on the following context, which can include text, tables, and image summaries:
+                CONTEXT:
+                {context}
+                QUESTION: {question}
+                If the context does not contain the answer, say "Sorry, I don't have enough information to answer that."
+                Answer:
+                """
+                rag_prompt = ChatPromptTemplate.from_template(rag_prompt_template)
+                llm = ChatOpenAI(model="gpt-4o", temperature=0.1)
+                rag_chain = rag_prompt | llm | StrOutputParser()
+                
+                response = rag_chain.invoke({"context": context, "question": prompt})
+                
+                st.markdown(response)
+                if relevant_images:
+                    st.write("Relevant images from the document:")
+                    for img_b64 in relevant_images:
+                        st.image(base64.b64decode(img_b64), width=300)
+
+                st.session_state.messages.append({
+                    "role": "assistant", 
+                    "content": response, 
+                    "images": relevant_images
+                })
